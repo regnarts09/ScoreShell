@@ -25,12 +25,13 @@ const BG_GREEN  = "\x1b[42m";
 const BG_AMBER  = "\x1b[43m";
 const BG_RED    = "\x1b[41m";
 const BG_BLUE   = "\x1b[44m";
-const CLEAR  = "\x1b[2J\x1b[3J\x1b[H";
+const CLEAR  = "\x1b[H\x1b[J";    // Cursor home + erase below (overwrites in place, preserves scrollback)
 const HIDE_CURSOR = "\x1b[?25l";
 const SHOW_CURSOR = "\x1b[?25h";
 
 // ─── Terminal helpers ────────────────────────────────────────
 const W = () => process.stdout.columns || 80;
+const H = () => process.stdout.rows || 24;
 const print = (s = "") => process.stdout.write(s + "\n");
 const cls   = () => process.stdout.write(CLEAR);
 const hr    = (ch = "─", color = MUTED) => print(color + ch.repeat(W()) + R);
@@ -341,11 +342,11 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function playAnimation(frames, delays, colorFn, banner, bannerColor) {
   process.stdout.write(HIDE_CURSOR);
   try {
-    // Full clear + scrollback wipe on first frame only
+    // First frame: clear visible area and start drawing
     process.stdout.write(CLEAR);
     for (let i = 0; i < frames.length; i++) {
-      // After first clear, just jump to top — no scrollback append
-      if (i > 0) process.stdout.write("\x1b[H\x1b[2J");
+      // Overwrite from top — no scrollback append
+      if (i > 0) process.stdout.write("\x1b[H\x1b[J");
       for (const line of frames[i]) {
         process.stdout.write(colorFn(line) + "\n");
       }
@@ -353,7 +354,7 @@ async function playAnimation(frames, delays, colorFn, banner, bannerColor) {
     }
     // Flash banner 5 times
     for (let f = 0; f < 5; f++) {
-      process.stdout.write("\x1b[H\x1b[2J");
+      process.stdout.write("\x1b[H\x1b[J");
       if (f % 2 === 0) {
         for (const line of banner) {
           process.stdout.write(bannerColor + BOLD + line + R + "\n");
@@ -361,7 +362,7 @@ async function playAnimation(frames, delays, colorFn, banner, bannerColor) {
       }
       await delay(f % 2 === 0 ? 160 : 80);
     }
-    process.stdout.write("\x1b[H\x1b[2J");
+    process.stdout.write("\x1b[H\x1b[J");
     for (const line of banner) {
       process.stdout.write(bannerColor + BOLD + line + R + "\n");
     }
@@ -922,6 +923,53 @@ function stateColor(state) {
   return CYAN;
 }
 
+// ─── Viewport helper ─────────────────────────────────────────
+// Computes which items [start, end) to render so the selected
+// item is always visible within the available terminal rows.
+function computeViewport(items, linesPerItem, selected, availableRows) {
+  const n = items.length;
+  if (n === 0) return { start: 0, end: 0 };
+
+  // Try to center the selected item in the viewport
+  // First, figure out how many items fit
+  let start = 0, end = 0, usedRows = 0;
+
+  // Start from selected and expand outward
+  // 1) Calculate a start that keeps selected visible
+  // Walk backward from selected to find how far up we can go
+  let totalLines = 0;
+  for (let i = 0; i < n; i++) totalLines += linesPerItem[i];
+
+  // If everything fits, show all
+  if (totalLines <= availableRows) return { start: 0, end: n };
+
+  // Binary-search style: find a window around selected
+  // Start by putting selected at the top and expanding down
+  start = selected;
+  usedRows = 0;
+  end = start;
+  while (end < n && usedRows + linesPerItem[end] <= availableRows) {
+    usedRows += linesPerItem[end];
+    end++;
+  }
+
+  // If we have room, try to expand upward
+  while (start > 0 && usedRows + linesPerItem[start - 1] <= availableRows) {
+    start--;
+    usedRows += linesPerItem[start];
+  }
+
+  // If selected is near the end, shift viewport up
+  if (end >= n && start > 0) {
+    while (start > 0 && usedRows + linesPerItem[start - 1] <= availableRows) {
+      start--;
+      usedRows += linesPerItem[start];
+    }
+  }
+
+  return { start, end };
+}
+
 // ─── Render screens ───────────────────────────────────────────
 
 function renderHeader(sport, subtitle = "") {
@@ -940,27 +988,40 @@ function renderHelp(extra = "") {
   hr();
 }
 
+
 // ── Cricket List ──────────────────────────────────────────────
 function renderCricketList(matches, selected = 0) {
   cls();
   renderHeader("CRICKET");
   print(BOLD + "  #  Teams                          Format   Status" + R);
   hr("─");
-  matches.forEach((m, i) => {
+
+  // Viewport scrolling: header uses ~7 lines, footer ~3, each match 1-2 lines
+  const headerLines = 7;
+  const footerLines = 4;
+  const availableRows = Math.max(5, H() - headerLines - footerLines);
+  // Estimate lines per match (some have score lines)
+  const matchLines = matches.map(m => m.score1 ? 2 : 1);
+  const { start, end } = computeViewport(matches, matchLines, selected, availableRows);
+
+  if (start > 0) print(MUTED + "  ▲ " + start + " more above" + R);
+  for (let i = start; i < end; i++) {
+    const m = matches[i];
     const sel = i === selected;
     const prefix = sel ? GREEN + "> " : "  ";
     const num = rpad(String(i + 1), 2) + " ";
     const title = pad(m.title, 30);
     const fmt = pad(m.format, 8);
-    const sc = stateColor(m.state);
     const statusStr = m.state === "In Progress"
       ? GREEN + BOLD + "● LIVE" + R
       : m.state === "Complete" ? MUTED + "✓ Full" + R : CYAN + "◷ Sched" + R;
     print(prefix + AMBER + num + R + (sel ? BOLD : "") + WHITE + title + R + MUTED + fmt + R + "  " + statusStr);
     if (m.score1) print("     " + MUTED + m.score1 + (m.score2 ? "  |  " + m.score2 : "") + R);
-  });
+  }
+  if (end < matches.length) print(MUTED + "  ▼ " + (matches.length - end) + " more below" + R);
+
   print("");
-  renderHelp("[number] quick-pick");
+  renderHelp("[# + Enter] jump to match");
 }
 
 // ── Football List ─────────────────────────────────────────────
@@ -969,11 +1030,19 @@ function renderFootballList(matches, selected = 0) {
   renderHeader("FOOTBALL");
   print(BOLD + "  #  Match                              Score    Status" + R);
   hr("─");
-  matches.forEach((m, i) => {
+
+  const headerLines = 7;
+  const footerLines = 4;
+  const availableRows = Math.max(5, H() - headerLines - footerLines);
+  const matchLines = matches.map(m => m.league ? 2 : 1);
+  const { start, end } = computeViewport(matches, matchLines, selected, availableRows);
+
+  if (start > 0) print(MUTED + "  ▲ " + start + " more above" + R);
+  for (let i = start; i < end; i++) {
+    const m = matches[i];
     const sel = i === selected;
     const prefix = sel ? GREEN + "> " : "  ";
     const num = rpad(String(i + 1), 2) + " ";
-    const title = pad(`${m.homeAbbr} vs ${m.awayAbbr}`, 12);
     const fullTitle = pad(`${m.homeTeam} vs ${m.awayTeam}`, 32);
     const score = m.state === "Upcoming" ? "    -  -   " : pad(`${m.homeScore} - ${m.awayScore}`, 10);
     const statusStr = m.state === "In Progress"
@@ -981,9 +1050,11 @@ function renderFootballList(matches, selected = 0) {
       : m.state === "Complete" ? MUTED + "FT" + R : CYAN + "SCH" + R;
     print(prefix + AMBER + num + R + (sel ? BOLD : "") + WHITE + fullTitle + R + AMBER + score + R + "  " + statusStr);
     if (m.league) print("     " + MUTED + m.league + R);
-  });
+  }
+  if (end < matches.length) print(MUTED + "  ▼ " + (matches.length - end) + " more below" + R);
+
   print("");
-  renderHelp("[number] quick-pick");
+  renderHelp("[# + Enter] jump to match");
 }
 
 // ── Basketball List ───────────────────────────────────────────
@@ -992,7 +1063,16 @@ function renderBasketballList(matches, selected = 0) {
   renderHeader("BASKETBALL (NBA)");
   print(BOLD + "  #  Match                              Score    Status" + R);
   hr("─");
-  matches.forEach((m, i) => {
+
+  const headerLines = 7;
+  const footerLines = 4;
+  const availableRows = Math.max(5, H() - headerLines - footerLines);
+  const matchLines = matches.map(() => 1);
+  const { start, end } = computeViewport(matches, matchLines, selected, availableRows);
+
+  if (start > 0) print(MUTED + "  ▲ " + start + " more above" + R);
+  for (let i = start; i < end; i++) {
+    const m = matches[i];
     const sel = i === selected;
     const prefix = sel ? GREEN + "> " : "  ";
     const num = rpad(String(i + 1), 2) + " ";
@@ -1004,9 +1084,11 @@ function renderBasketballList(matches, selected = 0) {
       ? GREEN + BOLD + "● " + m.clock + R
       : m.state === "Complete" ? MUTED + "Final" + R : CYAN + m.clock + R;
     print(prefix + AMBER + num + R + (sel ? BOLD : "") + WHITE + title + R + ORANGE + score + R + "  " + statusStr);
-  });
+  }
+  if (end < matches.length) print(MUTED + "  ▼ " + (matches.length - end) + " more below" + R);
+
   print("");
-  renderHelp("[number] quick-pick");
+  renderHelp("[# + Enter] jump to match");
 }
 
 // ── Cricket Detail ────────────────────────────────────────────
@@ -1276,6 +1358,8 @@ async function renderSportSelector() {
   const sports = ["CRICKET", "FOOTBALL", "BASKETBALL"];
   const colors = [GREEN, AMBER, ORANGE];
   let sel = 0;
+  let escBuf = "";
+  let escTimer = null;
 
   return new Promise(resolve => {
     function draw() {
@@ -1307,6 +1391,29 @@ async function renderSportSelector() {
     process.stdin.setEncoding("utf8");
 
     function onKey(key) {
+      // Buffer escape sequences for arrow keys
+      if (escBuf.length > 0) {
+        escBuf += key;
+        if (escTimer) { clearTimeout(escTimer); escTimer = null; }
+        if (escBuf === "\x1b[A" || escBuf === "\x1b[B" ||
+            escBuf === "\x1b[C" || escBuf === "\x1b[D") {
+          const seq = escBuf;
+          escBuf = "";
+          if (seq === "\x1b[A") { sel = (sel - 1 + sports.length) % sports.length; draw(); }
+          else if (seq === "\x1b[B") { sel = (sel + 1) % sports.length; draw(); }
+          return;
+        }
+        if (escBuf.length >= 3) { escBuf = ""; return; }
+        escTimer = setTimeout(() => { escBuf = ""; }, 100);
+        return;
+      }
+
+      if (key === "\x1b") {
+        escBuf = "\x1b";
+        escTimer = setTimeout(() => { escBuf = ""; }, 100);
+        return;
+      }
+
       if (key === "\x1b[A" || key === "k") { sel = (sel - 1 + sports.length) % sports.length; draw(); }
       else if (key === "\x1b[B" || key === "j") { sel = (sel + 1) % sports.length; draw(); }
       else if (key === "\r" || key === "\n") {
@@ -1322,36 +1429,144 @@ async function renderSportSelector() {
 // ─── Generic list navigator ───────────────────────────────────
 async function pickFromList(items, renderFn, getState) {
   let sel = 0;
+  let numberBuf = "";      // Buffer for multi-digit number entry
+  let numberTimer = null;  // Timer to clear stale buffer
+  let escBuf = "";         // Buffer for escape sequences (arrow keys)
+  let escTimer = null;     // Timer to clear incomplete escape sequences
 
   return new Promise(resolve => {
-    function draw() { renderFn(items, sel); }
+    function draw() {
+      renderFn(items, sel);
+      // Show number input prompt if user is typing a number
+      if (numberBuf.length > 0) {
+        process.stdout.write(CYAN + "  → Enter match #: " + BOLD + WHITE + numberBuf + MUTED + "_ " + R + MUTED + " (press Enter to confirm, Esc to cancel)" + R + "\n");
+      }
+    }
     draw();
 
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding("utf8");
 
+    function clearNumberBuf() {
+      if (numberTimer) { clearTimeout(numberTimer); numberTimer = null; }
+      numberBuf = "";
+    }
+
     function onKey(key) {
-      if (key === "\x1b[A" || key === "k") { sel = Math.max(0, sel - 1); draw(); }
-      else if (key === "\x1b[B" || key === "j") { sel = Math.min(items.length - 1, sel + 1); draw(); }
-      else if (key === "\r" || key === "\n") {
-        process.stdin.removeListener("data", onKey);
-        resolve({ action: "select", item: items[sel] });
+      // ── Handle escape sequences for arrow keys ──
+      // On some terminals (especially Windows), escape sequences may arrive
+      // as separate data events: \x1b, then [, then A/B/C/D.
+      // We buffer them to reconstruct the full sequence.
+      if (escBuf.length > 0) {
+        escBuf += key;
+        if (escTimer) { clearTimeout(escTimer); escTimer = null; }
+        // Check if we have a complete arrow sequence
+        if (escBuf === "\x1b[A" || escBuf === "\x1b[B" ||
+            escBuf === "\x1b[C" || escBuf === "\x1b[D" ||
+            escBuf === "\x1b[5" || escBuf === "\x1b[6" ||
+            escBuf === "\x1b[H" || escBuf === "\x1b[F") {
+          const seq = escBuf;
+          escBuf = "";
+          if (seq === "\x1b[A") { sel = Math.max(0, sel - 1); draw(); }
+          else if (seq === "\x1b[B") { sel = Math.min(items.length - 1, sel + 1); draw(); }
+          else if (seq === "\x1b[H") { sel = 0; draw(); }            // Home
+          else if (seq === "\x1b[F") { sel = items.length - 1; draw(); } // End
+          // Left/Right ignored
+          return;
+        }
+        // Page Up / Page Down (\x1b[5~ and \x1b[6~)
+        if (escBuf === "\x1b[5~") { escBuf = ""; sel = Math.max(0, sel - 10); draw(); return; }
+        if (escBuf === "\x1b[6~") { escBuf = ""; sel = Math.min(items.length - 1, sel + 10); draw(); return; }
+        // If buffer is 3+ chars and not a known sequence, discard
+        if (escBuf.length >= 4) { escBuf = ""; return; }
+        // Still waiting for more chars
+        escTimer = setTimeout(() => { escBuf = ""; }, 100);
+        return;
       }
-      else if (key === "b" || key === "B") {
+
+      // Start of escape sequence
+      if (key === "\x1b") {
+        // Could be Esc key alone or start of arrow sequence
+        // If user is in number entry mode, Esc cancels
+        escBuf = "\x1b";
+        escTimer = setTimeout(() => {
+          // Timeout: this was just the Esc key, not an arrow
+          escBuf = "";
+          if (numberBuf.length > 0) {
+            clearNumberBuf();
+            draw();
+          }
+        }, 100);
+        return;
+      }
+
+      // Full escape sequences arriving as single data event (common case)
+      if (key === "\x1b[A" || key === "k") { sel = Math.max(0, sel - 1); draw(); return; }
+      if (key === "\x1b[B" || key === "j") { sel = Math.min(items.length - 1, sel + 1); draw(); return; }
+
+      // Enter — select current or buffered number
+      if (key === "\r" || key === "\n") {
+        if (numberBuf.length > 0) {
+          const idx = parseInt(numberBuf, 10) - 1;
+          clearNumberBuf();
+          if (idx >= 0 && idx < items.length) {
+            process.stdin.removeListener("data", onKey);
+            resolve({ action: "select", item: items[idx] });
+          } else {
+            // Invalid number — redraw with cleared buffer
+            draw();
+          }
+        } else {
+          process.stdin.removeListener("data", onKey);
+          resolve({ action: "select", item: items[sel] });
+        }
+        return;
+      }
+
+      // Back
+      if ((key === "b" || key === "B") && numberBuf.length === 0) {
         process.stdin.removeListener("data", onKey);
         resolve({ action: "back" });
+        return;
       }
-      else if (key === "q" || key === "\x03") { cleanup(); process.exit(0); }
-      else if (key >= "1" && key <= "9") {
-        const idx = parseInt(key) - 1;
-        if (idx < items.length) {
-          process.stdin.removeListener("data", onKey);
-          resolve({ action: "select", item: items[idx] });
+
+      // Quit
+      if ((key === "q" || key === "\x03") && numberBuf.length === 0) {
+        cleanup(); process.exit(0);
+      }
+
+      // Refresh (r) - redraw
+      if ((key === "r" || key === "R") && numberBuf.length === 0) {
+        draw(); return;
+      }
+
+      // Number input — buffer digits, require Enter to confirm
+      if (key.length === 1 && /\d/.test(key)) {
+        // Don't allow leading zero
+        if (numberBuf.length === 0 && key === "0") return;
+        // Cap at 3 digits (supports up to 999 matches)
+        if (numberBuf.length >= 3) return;
+        numberBuf += key;
+        // Reset the stale buffer timer (auto-clear after 5 seconds of no input)
+        if (numberTimer) clearTimeout(numberTimer);
+        numberTimer = setTimeout(() => { numberBuf = ""; draw(); }, 5000);
+        draw();
+        return;
+      }
+
+      // Backspace — remove last digit from number buffer
+      if (key === "\x7f" || key === "\b") {
+        if (numberBuf.length > 0) {
+          numberBuf = numberBuf.slice(0, -1);
+          if (numberTimer) clearTimeout(numberTimer);
+          if (numberBuf.length > 0) {
+            numberTimer = setTimeout(() => { numberBuf = ""; draw(); }, 5000);
+          }
+          draw();
         }
+        return;
       }
-      // Two-digit number entry
-      else if (key.length === 1 && /\d/.test(key)) { /* handled above for 1-9 */ }
     }
     process.stdin.on("data", onKey);
   });
@@ -1567,6 +1782,8 @@ async function main() {
     console.error("ScoreShell requires Node.js >= 18 (for native fetch). You have: " + process.version);
     process.exit(1);
   }
+
+  process.stdout.write(HIDE_CURSOR);
 
   process.on("SIGINT", () => { cleanup(); process.exit(0); });
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
